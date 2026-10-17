@@ -1,17 +1,18 @@
 `default_nettype none
 
 module ip_tiles #(
-    parameter MAX_TILES      = 2,
-    parameter TILE_W         = 120,
-    parameter TILE_H         = 80,
-    parameter HIT_Y          = 400,
-    parameter HIT_ZONE       = 60,
+    parameter MAX_TILES = 2,
+    parameter [10:0] TILE_W = 120,
+    parameter [10:0] TILE_H = 80,
+    parameter [10:0] HIT_Y = 400,
+    parameter [10:0] HIT_ZONE = 60,
     parameter [3:0] LEVEL_UP_AT = 4'd15
 ) (
     input  wire       clk, rst_n, step,
     input  wire [3:0] btn,
     input  wire [9:0] x, y,
     input  wire       active,
+    output wire       audio,
     output reg  [5:0] rgb
 );
     localparam IDX_W = $clog2(MAX_TILES);
@@ -40,7 +41,7 @@ module ip_tiles #(
     reg  [3:0] level_progress;
     reg  [2:0] level;
     reg        ended;
-    reg        is_win;              // ← NEW: distinguishes win from loss
+    reg        is_win;
 
     reg  [4:0] speed_cur;
     reg  [5:0] interval_cur;
@@ -140,14 +141,14 @@ module ip_tiles #(
                 end else if (hittable[g] || miss_vec[g]) begin
                     tile_alive[g] <= 1'b0;
                 end else if (step && !ended && tile_alive[g]) begin
-                    tile_y[g] <= tile_y[g] + speed_cur;
+                    tile_y[g] <= tile_y[g] + {4'd0, speed_cur};
                 end
             end
         end
     endgenerate
 
     // ------------------------------------------------------------------
-    // game state machine — demote on miss, die at level 1
+    // game state machine
     // ------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n || restart_clear) begin
@@ -155,7 +156,7 @@ module ip_tiles #(
             level_progress <= 4'd0;
             level          <= 3'd1;
             ended          <= 1'b0;
-            is_win         <= 1'b0;         // ← reset win flag
+            is_win         <= 1'b0;
             if (!rst_n) lfsr <= 4'hA;
         end else if (!ended) begin
             if (spawn_due) begin
@@ -173,7 +174,7 @@ module ip_tiles #(
                         level <= level + 3'd1;
                     else begin
                         ended  <= 1'b1;
-                        is_win <= 1'b1;     // ← win: completed level 5
+                        is_win <= 1'b1;
                     end
                 end else begin
                     level_progress <= level_progress + 4'd1;
@@ -185,7 +186,7 @@ module ip_tiles #(
             if (any_miss) begin
                 if (level == 3'd1) begin
                     ended  <= 1'b1;
-                    is_win <= 1'b0;         // ← loss: missed at level 1
+                    is_win <= 1'b0;
                 end else begin
                     level          <= level - 3'd1;
                     level_progress <= 4'd0;
@@ -195,7 +196,7 @@ module ip_tiles #(
     end
 
     // ------------------------------------------------------------------
-    // tile rendering (cached tile_x)
+    // tile rendering
     // ------------------------------------------------------------------
     wire [MAX_TILES-1:0] tile_pixel;
     generate
@@ -213,17 +214,172 @@ module ip_tiles #(
     endgenerate
     wire any_tile_pixel = |tile_pixel;
 
-    // ------------------------------------------------------------------
-    // 5-segment progress bar (one segment per level, single colour)
-    // ------------------------------------------------------------------
-    wire [9:0] bar_right = ({7'd0, level}              << 7)
-                         + ({5'd0, level_progress}     << 3)
+    // ==================================================================
+    // AUDIO ENGINE — hit / miss / wrong / win / loss
+    // ==================================================================
+
+    // 100 kHz tone reference from 25 MHz clock
+    reg  [7:0] prescaler;
+    wire       tone_tick = (prescaler == 8'd249);
+    always @(posedge clk) begin
+        if (!rst_n)         prescaler <= 8'd0;
+        else if (tone_tick) prescaler <= 8'd0;
+        else                prescaler <= prescaler + 8'd1;
+    end
+
+    // Rising-edge detector for `ended` → triggers win/loss melodies
+    reg ended_prev;
+    always @(posedge clk) begin
+        if (!rst_n) ended_prev <= 1'b0;
+        else        ended_prev <= ended;
+    end
+    wire ended_rise = ended & ~ended_prev;
+    wire win_rise   = ended_rise &  is_win;
+    wire loss_rise  = ended_rise & ~is_win;
+
+    // --------------------------------------------------------------
+    // Melody state (win / loss)
+    // --------------------------------------------------------------
+    reg  [2:0] mel_type;      // 0=idle, 1=win, 2=loss
+    reg  [2:0] mel_note;      // which note in the melody (0..3)
+    reg  [3:0] mel_timer;     // frames remaining on this note
+    reg  [7:0] mel_period;
+
+    wire melody_active = (mel_type != 3'd0);
+
+    always @(posedge clk) begin
+        if (!rst_n || restart_clear) begin
+            mel_type   <= 3'd0;
+            mel_note   <= 3'd0;
+            mel_timer  <= 4'd0;
+            mel_period <= 8'd50;
+        end else if (win_rise) begin
+            mel_type   <= 3'd1;
+            mel_note   <= 3'd0;
+            mel_timer  <= 4'd5;
+            mel_period <= 8'd50;           // C6 (1.00 kHz)
+        end else if (loss_rise) begin
+            mel_type   <= 3'd2;
+            mel_note   <= 3'd0;
+            mel_timer  <= 4'd8;
+            mel_period <= 8'd128;          // G4 (~390 Hz)
+        end else if (step && mel_type != 3'd0) begin
+            if (mel_timer != 4'd0) begin
+                mel_timer <= mel_timer - 4'd1;
+            end else begin
+                if (mel_type == 3'd1) begin
+                    // Win: C6 → E6 → G6 → C7
+                    if (mel_note < 3'd3) begin
+                        case (mel_note)
+                            3'd0: mel_period <= 8'd40;   // E6 (1.25 kHz)
+                            3'd1: mel_period <= 8'd30;   // G6 (1.67 kHz)
+                            default: mel_period <= 8'd20; // C7 (2.50 kHz)
+                        endcase
+                        mel_note  <= mel_note + 3'd1;
+                        mel_timer <= 4'd5;
+                    end else begin
+                        mel_type <= 3'd0;            // melody done
+                    end
+                end else begin
+                    // Loss: G4 → E4 → C4
+                    if (mel_note < 3'd2) begin
+                        case (mel_note)
+                            3'd0: mel_period <= 8'd152;  // E4 (~330 Hz)
+                            default: mel_period <= 8'd191; // C4 (~262 Hz)
+                        endcase
+                        mel_note  <= mel_note + 3'd1;
+                        mel_timer <= 4'd8;
+                    end else begin
+                        mel_type <= 3'd0;            // melody done
+                    end
+                end
+            end
+        end
+    end
+
+    // --------------------------------------------------------------
+    // One-shot sounds (hit / miss / wrong) — suppressed during melody
+    // --------------------------------------------------------------
+    // Find the winning lane (highest-index first to match priority)
+    reg [1:0] hit_lane;
+    integer i;
+    always @(*) begin
+        hit_lane = 2'd0;
+        for (i = MAX_TILES-1; i >= 0; i = i - 1)
+            if (hittable[i]) hit_lane = tile_lane[i];
+    end
+
+    wire [7:0] hit_period = (hit_lane == 2'd0) ? 8'd50 :
+                            (hit_lane == 2'd1) ? 8'd40 :
+                            (hit_lane == 2'd2) ? 8'd30 :
+                                                 8'd20;
+
+    wire snd_hit   = any_hit        && !melody_active && !win_rise;
+    wire snd_miss  = any_miss       && !any_hit && !melody_active && !loss_rise;
+    wire snd_wrong = any_wrong_press && !any_hit && !any_miss && !melody_active;
+
+    reg  [2:0] dur_steps;
+    reg  [7:0] tone_period;
+    always @(posedge clk) begin
+        if (!rst_n || restart_clear) begin
+            dur_steps   <= 3'd0;
+            tone_period <= 8'd50;
+        end else if (win_rise || loss_rise) begin
+            dur_steps   <= 3'd0;          // clear one-shot when melody starts
+        end else if (snd_hit) begin
+            dur_steps   <= 3'd4;          // 66 ms
+            tone_period <= hit_period;
+        end else if (snd_miss) begin
+            dur_steps   <= 3'd6;          // 100 ms
+            tone_period <= 8'd200;        // ~250 Hz
+        end else if (snd_wrong) begin
+            dur_steps   <= 3'd3;          // 50 ms
+            tone_period <= 8'd100;        // ~500 Hz
+        end else if (step && dur_steps != 3'd0) begin
+            dur_steps   <= dur_steps - 3'd1;
+        end
+    end
+
+    // --------------------------------------------------------------
+    // Shared oscillator — follows whichever period is active
+    // --------------------------------------------------------------
+    wire [7:0] active_period = melody_active ? mel_period : tone_period;
+    wire       sound_active  = melody_active || (dur_steps != 3'd0);
+
+    reg  [7:0] tone_cnt;
+    reg        tone_pol;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            tone_cnt <= 8'd0;
+            tone_pol <= 1'b0;
+        end else if (sound_active) begin
+            if (tone_tick) begin
+                if (tone_cnt >= active_period) begin
+                    tone_cnt <= 8'd0;
+                    tone_pol <= ~tone_pol;
+                end else begin
+                    tone_cnt <= tone_cnt + 8'd1;
+                end
+            end
+        end else begin
+            tone_cnt <= 8'd0;
+            tone_pol <= 1'b0;
+        end
+    end
+
+    assign audio = sound_active && tone_pol;
+
+    // ==================================================================
+    // HUD
+    // ==================================================================
+
+    // 5-segment progress bar
+    wire [9:0] bar_right = ({7'd0, level} << 7)
+                         + ({6'd0, level_progress} << 3)
                          - 10'd120;
     wire bar_pixel = (y < 10'd8) && (x < bar_right);
 
-    // ------------------------------------------------------------------
     // hit line + press highlight
-    // ------------------------------------------------------------------
     wire [10:0] y11_hud = {1'b0, y};
     wire on_hit_line = (y11_hud >= HIT_Y) && (y11_hud < HIT_Y + 11'd2);
 
@@ -232,23 +388,19 @@ module ip_tiles #(
                         (x < 10'd480) ? 2'd2 : 2'd3;
     wire hit_line_pressed = on_hit_line && lane_active[x_lane];
 
-    // ------------------------------------------------------------------
     // lane dividers
-    // ------------------------------------------------------------------
     wire lane_div = (x == 10'd160) || (x == 10'd320) || (x == 10'd480);
 
-    // ------------------------------------------------------------------
-    // colour priority — GREEN win, RED loss
-    // ------------------------------------------------------------------
+    // colour priority
     always @(*) begin
         if (!active)                rgb = 6'b00_00_00;
-        else if (ended && is_win)   rgb = 6'b00_11_00;   // ← green victory
-        else if (ended)             rgb = 6'b11_00_00;   // red defeat
-        else if (any_tile_pixel)    rgb = 6'b11_11_11;   // white tile
-        else if (bar_pixel)         rgb = 6'b00_11_00;   // green progress bar
-        else if (hit_line_pressed)  rgb = 6'b11_11_00;   // yellow pressed lane
-        else if (on_hit_line)       rgb = 6'b00_11_11;   // cyan default
-        else if (lane_div)          rgb = 6'b01_01_01;   // grey dividers
-        else                        rgb = 6'b00_00_01;   // dark blue background
+        else if (ended && is_win)   rgb = 6'b00_11_00;
+        else if (ended)             rgb = 6'b11_00_00;
+        else if (hit_line_pressed)  rgb = 6'b11_11_00;
+        else if (on_hit_line)       rgb = 6'b00_11_11;
+        else if (any_tile_pixel)    rgb = 6'b11_11_11;
+        else if (bar_pixel)         rgb = 6'b00_11_00;
+        else if (lane_div)          rgb = 6'b01_01_01;
+        else                        rgb = 6'b00_00_01;
     end
 endmodule
